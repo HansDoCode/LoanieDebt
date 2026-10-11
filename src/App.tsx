@@ -433,7 +433,7 @@ function App() {
         </div>
         <div className="topbar-actions">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <span className={`mode-badge ${cloudConfigured ? "mode-cloud" : "mode-local"}`}>{cloudConfigured ? "Cloud" : "Local demo"}</span>
+          {!cloudConfigured && <span className="mode-badge mode-local">Local demo</span>}
           <button className="button button-quiet" type="button" onClick={() => void lock()}>Lock</button>
         </div>
       </header>
