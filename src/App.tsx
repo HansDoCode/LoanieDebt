@@ -32,6 +32,7 @@ import { cloudConfigured, loadData, saveData, supabase } from "./repository";
 import type { AppData, AppSettings, Borrower, Loan, Payment, Reward } from "./types";
 
 type View = "home" | "loans" | "borrowers" | "more";
+type Theme = "light" | "dark";
 type ModalState =
   | { kind: "borrower"; borrowerId?: string }
   | { kind: "loan"; borrowerId?: string; priorLoanId?: string }
@@ -43,6 +44,8 @@ type ModalState =
   | { kind: "restore"; data: AppData };
 
 const localPinKey = "lanies-debt-manager:owner-pin:v1";
+const themeKey = "lanies-debt-manager:theme:v1";
+const rememberedEmailKey = "lanies-debt-manager:last-email:v1";
 
 function getSessionUser(session: { user?: { id: string; email?: string | null } } | null) {
   return session?.user ? { id: session.user.id, email: session.user.email ?? "" } : null;
@@ -111,6 +114,11 @@ function ErrorText({ children }: { children: ReactNode }) {
   return <p className="form-error" role="alert">{children}</p>;
 }
 
+function ThemeToggle({ theme, onToggle }: { theme: Theme; onToggle: () => void }) {
+  const nextTheme = theme === "dark" ? "light" : "dark";
+  return <button className="button button-quiet theme-toggle" type="button" aria-label={`Switch to ${nextTheme} mode`} aria-pressed={theme === "dark"} onClick={onToggle}>{theme === "dark" ? "Light mode" : "Dark mode"}</button>;
+}
+
 function StatusChip({ status }: { status: ReturnType<typeof loanDisplayStatus> }) {
   return <span className={statusClass(status)}>{statusLabel(status)}</span>;
 }
@@ -119,10 +127,11 @@ function EmptyState({ title, children }: { title: string; children: ReactNode })
   return <div className="empty-state"><div className="empty-icon">○</div><h3>{title}</h3><p>{children}</p></div>;
 }
 
-function CloudAuth({ onError }: { onError: (message: string) => void }) {
+function CloudAuth({ onError, theme, onToggleTheme }: { onError: (message: string) => void; theme: Theme; onToggleTheme: () => void }) {
   const [signUp, setSignUp] = useState(false);
-  const [email, setEmail] = useState("");
+  const [email, setEmail] = useState(() => localStorage.getItem(rememberedEmailKey) ?? "");
   const [password, setPassword] = useState("");
+  const [rememberEmail, setRememberEmail] = useState(true);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
 
@@ -133,10 +142,13 @@ function CloudAuth({ onError }: { onError: (message: string) => void }) {
     setBusy(true);
     try {
       if (!supabase) throw new Error("Supabase is not configured.");
+      const normalizedEmail = email.trim();
       const result = signUp
-        ? await supabase.auth.signUp({ email, password })
-        : await supabase.auth.signInWithPassword({ email, password });
+        ? await supabase.auth.signUp({ email: normalizedEmail, password })
+        : await supabase.auth.signInWithPassword({ email: normalizedEmail, password });
       if (result.error) throw result.error;
+      if (rememberEmail) localStorage.setItem(rememberedEmailKey, normalizedEmail);
+      else localStorage.removeItem(rememberedEmailKey);
       if (signUp && !result.data.session) setMessage("Account created. Check your email if confirmation is enabled, then sign in.");
     } catch (error) {
       onError(error instanceof Error ? error.message : "Could not sign in.");
@@ -148,12 +160,14 @@ function CloudAuth({ onError }: { onError: (message: string) => void }) {
   return (
     <main className="auth-shell">
       <div className="auth-card">
+        <div className="auth-card-tools"><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div>
         <div className="brand-mark large">₱</div>
         <h1>{signUp ? "Create your account" : "Welcome back"}</h1>
         <p className="muted">Your records are private to your account.</p>
         <form className="stack" onSubmit={submit}>
           <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label>
           <label>Password<input type="password" autoComplete={signUp ? "new-password" : "current-password"} minLength={6} value={password} onChange={(event) => setPassword(event.target.value)} required /></label>
+          <label className="checkbox-label"><input type="checkbox" checked={rememberEmail} onChange={(event) => setRememberEmail(event.target.checked)} /><span>Remember this email on this device</span></label>
           {message && <p className="success-text">{message}</p>}
           <button className="button button-primary button-block" type="submit" disabled={busy}>{busy ? "Working…" : signUp ? "Create account" : "Sign in"}</button>
         </form>
@@ -165,7 +179,7 @@ function CloudAuth({ onError }: { onError: (message: string) => void }) {
   );
 }
 
-function LocalLock({ configured, onUnlock, onError }: { configured: boolean; onUnlock: () => void; onError: (message: string) => void }) {
+function LocalLock({ configured, onUnlock, onError, theme, onToggleTheme }: { configured: boolean; onUnlock: () => void; onError: (message: string) => void; theme: Theme; onToggleTheme: () => void }) {
   const [pin, setPin] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
@@ -198,6 +212,7 @@ function LocalLock({ configured, onUnlock, onError }: { configured: boolean; onU
   return (
     <main className="auth-shell">
       <div className="auth-card">
+        <div className="auth-card-tools"><ThemeToggle theme={theme} onToggle={onToggleTheme} /></div>
         <div className="brand-mark large">₱</div>
         <h1>{configured ? "Unlock your records" : "Protect your records"}</h1>
         <p className="muted">{configured ? "Enter your PIN to continue." : "Set a PIN for this browser. Online storage is not connected yet."}</p>
@@ -252,6 +267,16 @@ function App() {
   const [loanFilter, setLoanFilter] = useState("all");
   const [borrowerSearch, setBorrowerSearch] = useState("");
   const [restoreCandidate, setRestoreCandidate] = useState<AppData | null>(null);
+  const [theme, setTheme] = useState<Theme>(() => localStorage.getItem(themeKey) === "dark" ? "dark" : "light");
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem(themeKey, theme);
+  }, [theme]);
+
+  function toggleTheme() {
+    setTheme((current) => current === "dark" ? "light" : "dark");
+  }
 
   useEffect(() => {
     if (!cloudConfigured || !supabase) {
@@ -350,8 +375,8 @@ function App() {
   }, [borrowerSearch, data.borrowers]);
 
   if (!authReady) return <main className="auth-shell"><div className="loading-card">Loading secure access…</div></main>;
-  if (cloudConfigured && !cloudSession) return <><CloudAuth onError={setError} />{error && <div className="global-auth-error"><ErrorText>{error}</ErrorText></div>}</>;
-  if (!cloudConfigured && !localUnlocked) return <><LocalLock configured={localPinConfigured} onUnlock={() => setLocalUnlocked(true)} onError={setError} />{error && <div className="global-auth-error"><ErrorText>{error}</ErrorText></div>}</>;
+  if (cloudConfigured && !cloudSession) return <><CloudAuth onError={setError} theme={theme} onToggleTheme={toggleTheme} />{error && <div className="global-auth-error"><ErrorText>{error}</ErrorText></div>}</>;
+  if (!cloudConfigured && !localUnlocked) return <><LocalLock configured={localPinConfigured} onUnlock={() => setLocalUnlocked(true)} onError={setError} theme={theme} onToggleTheme={toggleTheme} />{error && <div className="global-auth-error"><ErrorText>{error}</ErrorText></div>}</>;
 
   function openBorrower(id: string) {
     setBorrowerProfileId(id);
@@ -407,6 +432,7 @@ function App() {
           <div><strong>Loanie's Debt</strong></div>
         </div>
         <div className="topbar-actions">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
           <span className={`mode-badge ${cloudConfigured ? "mode-cloud" : "mode-local"}`}>{cloudConfigured ? "Cloud" : "Local demo"}</span>
           <button className="button button-quiet" type="button" onClick={() => void lock()}>Lock</button>
         </div>
