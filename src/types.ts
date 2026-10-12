@@ -30,6 +30,7 @@ export interface Loan {
   paidDate?: string;
   guarantorName?: string;
   guarantorPhone?: string;
+  signatureImageDataUrl?: string;
   createdAt: string;
   updatedAt: string;
   deletedAt?: string;

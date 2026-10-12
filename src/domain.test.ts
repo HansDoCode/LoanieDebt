@@ -28,6 +28,7 @@ function fixture() {
     notes: "",
     guarantorName: "Ben Cruz",
     guarantorPhone: "",
+    signatureImageDataUrl: "data:image/png;base64,signature",
   });
   return { data: created.data, loan: created.loan, borrower };
 }
@@ -36,11 +37,12 @@ describe("debt ledger rules", () => {
   it("keeps a new loan pending until release and calculates centavo balances", () => {
     const { data, loan } = fixture();
     expect(loan.state).toBe("pending_release");
+    expect(loan.signatureImageDataUrl).toContain("data:image/png");
     expect(getLoanBalance(data, loan.id)).toBe(1_200_000);
     const released = releaseLoan(data, loan.id, 1_000_000, "2026-01-01", "");
-    const paid = recordPayment(released, { loanId: loan.id, amountCentavos: 30_000, receivedDate: "2026-01-02", note: "", proofImageDataUrl: "data:image/png;base64,proof" });
+    const paid = recordPayment(released, { loanId: loan.id, amountCentavos: 30_000, receivedDate: "2026-01-02", note: "" });
     expect(getLoanBalance(paid, loan.id)).toBe(1_170_000);
-    expect(paid.payments[0].proofImageDataUrl).toContain("data:image/png");
+    expect(paid.payments[0].proofImageDataUrl).toBeUndefined();
     expect(paid.loans.find((item) => item.id === loan.id)?.state).toBe("active");
   });
 
@@ -87,11 +89,29 @@ describe("debt ledger rules", () => {
       guarantorName: "",
       guarantorPhone: "",
       priorLoanId: loan.id,
+      signatureImageDataUrl: "data:image/png;base64,renewed-signature",
     });
     expect(renewed.loan.priorLoanId).toBe(loan.id);
     expect(renewed.data.loans.find((item) => item.id === loan.id)?.state).toBe("paid");
     expect(renewed.data.payments).toHaveLength(1);
     expect(renewed.loan.id).not.toBe(loan.id);
+  });
+
+  it("requires one signature photo for each new loan", () => {
+    const withBorrower = addBorrower(emptyData(), { fullName: "Ana Cruz", phone: "", area: "", notes: "" });
+    const borrower = withBorrower.borrowers[0];
+    expect(() => createLoan(withBorrower, {
+      borrowerId: borrower.id,
+      principalCentavos: 1_000_000,
+      totalDueCentavos: 1_200_000,
+      startDate: "2026-01-01",
+      dueDate: "2026-02-10",
+      termDays: 40,
+      notes: "",
+      guarantorName: "",
+      guarantorPhone: "",
+      signatureImageDataUrl: "",
+    })).toThrow("signature photo");
   });
 
   it("deletes cancelled loans without touching borrowers", () => {

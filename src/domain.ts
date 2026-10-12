@@ -231,6 +231,7 @@ export interface LoanInput {
   guarantorPhone: string;
   rewardCentavos?: number;
   priorLoanId?: string;
+  signatureImageDataUrl: string;
 }
 
 export function createLoan(data: AppData, input: LoanInput): { data: AppData; loan: Loan } {
@@ -239,6 +240,7 @@ export function createLoan(data: AppData, input: LoanInput): { data: AppData; lo
   if (!Number.isSafeInteger(input.totalDueCentavos) || input.totalDueCentavos < input.principalCentavos) throw new Error("Total due must be at least the principal.");
   if (!input.startDate || !input.dueDate) throw new Error("Start and due dates are required.");
   if (!Number.isInteger(input.termDays) || input.termDays <= 0) throw new Error("Term must be a positive number of days.");
+  if (!input.signatureImageDataUrl?.trim()) throw new Error("A signature photo is required for every loan.");
   if (input.guarantorName.trim() && (!Number.isSafeInteger(input.rewardCentavos ?? data.settings.defaultRewardCentavos) || (input.rewardCentavos ?? data.settings.defaultRewardCentavos) <= 0)) throw new Error("Reward must be greater than zero.");
   const createdAt = nowIso();
   const loan: Loan = {
@@ -254,6 +256,7 @@ export function createLoan(data: AppData, input: LoanInput): { data: AppData; lo
     notes: input.notes.trim(),
     guarantorName: input.guarantorName.trim() || undefined,
     guarantorPhone: input.guarantorPhone.trim() || undefined,
+    signatureImageDataUrl: input.signatureImageDataUrl,
     createdAt,
     updatedAt: createdAt,
   };
@@ -302,7 +305,7 @@ export function releaseLoan(
 
 export function recordPayment(
   data: AppData,
-  input: { loanId: string; amountCentavos: number; receivedDate: string; note: string; proofImageDataUrl?: string },
+  input: { loanId: string; amountCentavos: number; receivedDate: string; note: string },
 ): AppData {
   const loan = getLoan(data, input.loanId);
   if (loan.deletedAt || loan.state !== "active") throw new Error("Payments can only be recorded against an active loan.");
@@ -317,7 +320,6 @@ export function recordPayment(
     receivedDate: input.receivedDate,
     note: input.note.trim(),
     kind: "payment",
-    proofImageDataUrl: input.proofImageDataUrl,
     createdAt: nowIso(),
   };
   const closes = input.amountCentavos === balance;

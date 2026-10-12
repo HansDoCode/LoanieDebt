@@ -1,5 +1,5 @@
-const CACHE = "lanies-debt-shell-v2";
-const SHELL = ["/", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "lanies-debt-shell-v3";
+const SHELL = ["/", "/manifest.webmanifest", "/logo.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)));
