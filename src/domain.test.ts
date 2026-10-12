@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   addBorrower,
   createLoan,
+  deleteBorrower,
+  deleteLoan,
   deleteCancelledLoans,
   emptyData,
+  getLoanDayStats,
   getLoanBalance,
   markRewardPaid,
   recordPayment,
@@ -95,7 +98,24 @@ describe("debt ledger rules", () => {
     const { data, loan, borrower } = fixture();
     const cancelled = voidLoan(data, loan.id, "Borrower changed plans.");
     const cleaned = deleteCancelledLoans(cancelled);
-    expect(cleaned.loans).toHaveLength(0);
+    expect(cleaned.loans.filter((item) => !item.deletedAt)).toHaveLength(0);
     expect(cleaned.borrowers[0].id).toBe(borrower.id);
+  });
+
+  it("counts passed and no-payment days from the loan timeline", () => {
+    const { data, loan } = fixture();
+    const released = releaseLoan(data, loan.id, 1_000_000, "2026-01-01", "");
+    const paid = recordPayment(released, { loanId: loan.id, amountCentavos: 30_000, receivedDate: "2026-01-05", note: "" });
+    expect(getLoanDayStats(paid, loan, "2026-01-08")).toEqual({ daysPassed: 7, noPaymentDays: 3, lastPaymentDate: "2026-01-05" });
+  });
+
+  it("keeps deleted borrower and loan records recoverable", () => {
+    const { data, loan, borrower } = fixture();
+    const deletedLoan = deleteLoan(data, loan.id);
+    expect(deletedLoan.loans[0].deletedAt).toBeTruthy();
+    expect(deletedLoan.payments).toHaveLength(0);
+    const deletedBorrower = deleteBorrower(data, borrower.id);
+    expect(deletedBorrower.borrowers[0].deletedAt).toBeTruthy();
+    expect(deletedBorrower.loans[0].deletedAt).toBeTruthy();
   });
 });

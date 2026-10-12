@@ -10,6 +10,7 @@ export interface Borrower {
   notes: string;
   createdAt: string;
   updatedAt: string;
+  deletedAt?: string;
 }
 
 export interface Loan {
@@ -31,6 +32,7 @@ export interface Loan {
   guarantorPhone?: string;
   createdAt: string;
   updatedAt: string;
+  deletedAt?: string;
 }
 
 export interface Payment {

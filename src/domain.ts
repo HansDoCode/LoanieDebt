@@ -41,6 +41,13 @@ export function todayLocal(): string {
   return `${year}-${month}-${day}`;
 }
 
+export function daysBetweenLocal(startDate: string, endDate = todayLocal()): number {
+  const start = Date.parse(`${startDate}T00:00:00Z`);
+  const end = Date.parse(`${endDate}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+  return Math.max(0, Math.floor((end - start) / 86_400_000));
+}
+
 export function addDays(dateIso: string, days: number): string {
   const date = new Date(`${dateIso}T12:00:00`);
   date.setDate(date.getDate() + days);
@@ -83,6 +90,26 @@ export function parseMoney(value: string): number {
 
 export function borrowerName(data: AppData, borrowerId: string): string {
   return data.borrowers.find((borrower) => borrower.id === borrowerId)?.fullName ?? "Unknown borrower";
+}
+
+export interface LoanDayStats {
+  daysPassed: number;
+  noPaymentDays: number;
+  lastPaymentDate?: string;
+}
+
+export function getLoanDayStats(data: AppData, loan: Loan, date = todayLocal()): LoanDayStats {
+  const lastPaymentDate = getLoanPayments(data, loan.id)
+    .filter((payment) => payment.kind === "payment" && !isPaymentReversed(data, payment.id))
+    .map((payment) => payment.receivedDate)
+    .sort()
+    .at(-1);
+  const paymentStart = lastPaymentDate ?? loan.releaseDate ?? loan.startDate;
+  return {
+    daysPassed: daysBetweenLocal(loan.releaseDate ?? loan.startDate, date),
+    noPaymentDays: daysBetweenLocal(paymentStart, date),
+    lastPaymentDate,
+  };
 }
 
 export function getLoan(data: AppData, loanId: string): Loan {
@@ -133,7 +160,7 @@ export function likelyDuplicateBorrowers(
   const name = fullName.trim().toLowerCase();
   const normalizedPhone = phone.replace(/\D/g, "");
   return data.borrowers.filter((borrower) => {
-    if (borrower.id === exceptId) return false;
+    if (borrower.id === exceptId || borrower.deletedAt) return false;
     const sameName = name.length > 2 && borrower.fullName.trim().toLowerCase() === name;
     const borrowerPhone = borrower.phone.replace(/\D/g, "");
     const samePhone = normalizedPhone.length > 5 && borrowerPhone === normalizedPhone;
@@ -183,7 +210,7 @@ export function updateBorrower(
 ): AppData {
   const fullName = input.fullName.trim();
   if (!fullName) throw new Error("Full name is required.");
-  if (!data.borrowers.some((borrower) => borrower.id === borrowerId)) throw new Error("Borrower not found.");
+  if (!data.borrowers.some((borrower) => borrower.id === borrowerId && !borrower.deletedAt)) throw new Error("Borrower not found.");
   const borrowers = data.borrowers.map((borrower) =>
     borrower.id === borrowerId
       ? { ...borrower, fullName, phone: input.phone.trim(), area: input.area.trim(), notes: input.notes.trim(), updatedAt: nowIso() }
@@ -207,7 +234,7 @@ export interface LoanInput {
 }
 
 export function createLoan(data: AppData, input: LoanInput): { data: AppData; loan: Loan } {
-  if (!data.borrowers.some((borrower) => borrower.id === input.borrowerId)) throw new Error("Select a borrower.");
+  if (!data.borrowers.some((borrower) => borrower.id === input.borrowerId && !borrower.deletedAt)) throw new Error("Select a borrower.");
   if (!Number.isSafeInteger(input.principalCentavos) || input.principalCentavos <= 0) throw new Error("Principal must be greater than zero.");
   if (!Number.isSafeInteger(input.totalDueCentavos) || input.totalDueCentavos < input.principalCentavos) throw new Error("Total due must be at least the principal.");
   if (!input.startDate || !input.dueDate) throw new Error("Start and due dates are required.");
@@ -278,7 +305,7 @@ export function recordPayment(
   input: { loanId: string; amountCentavos: number; receivedDate: string; note: string; proofImageDataUrl?: string },
 ): AppData {
   const loan = getLoan(data, input.loanId);
-  if (loan.state !== "active") throw new Error("Payments can only be recorded against an active loan.");
+  if (loan.deletedAt || loan.state !== "active") throw new Error("Payments can only be recorded against an active loan.");
   if (!Number.isSafeInteger(input.amountCentavos) || input.amountCentavos <= 0) throw new Error("Payment must be greater than zero.");
   if (!input.receivedDate) throw new Error("Received date is required.");
   const balance = getLoanBalance(data, loan.id);
@@ -303,16 +330,30 @@ export function recordPayment(
 }
 
 export function deleteCancelledLoans(data: AppData): AppData {
-  const cancelledIds = new Set(data.loans.filter((loan) => loan.state === "voided").map((loan) => loan.id));
+  const cancelledIds = new Set(data.loans.filter((loan) => loan.state === "voided" && !loan.deletedAt).map((loan) => loan.id));
   if (!cancelledIds.size) return data;
-  const rewardIds = new Set(data.rewards.filter((reward) => cancelledIds.has(reward.loanId)).map((reward) => reward.id));
-  return {
-    ...data,
-    loans: data.loans.filter((loan) => !cancelledIds.has(loan.id)),
-    payments: data.payments.filter((payment) => !cancelledIds.has(payment.loanId)),
-    rewards: data.rewards.filter((reward) => !cancelledIds.has(reward.loanId)),
-    audit: data.audit.filter((entry) => !(cancelledIds.has(entry.entityId) || rewardIds.has(entry.entityId))),
-  };
+  const deletedAt = nowIso();
+  let next = { ...data, loans: data.loans.map((loan) => cancelledIds.has(loan.id) ? { ...loan, deletedAt, updatedAt: deletedAt } : loan) };
+  for (const loanId of cancelledIds) next = audit(next, "loan", loanId, "deleted");
+  return next;
+}
+
+export function deleteLoan(data: AppData, loanId: string): AppData {
+  const loan = getLoan(data, loanId);
+  if (loan.deletedAt) throw new Error("That loan has already been deleted.");
+  const deletedAt = nowIso();
+  const loans = data.loans.map((item) => item.id === loanId ? { ...item, deletedAt, updatedAt: deletedAt } : item);
+  return audit({ ...data, loans }, "loan", loanId, "deleted");
+}
+
+export function deleteBorrower(data: AppData, borrowerId: string): AppData {
+  const borrower = data.borrowers.find((item) => item.id === borrowerId);
+  if (!borrower || borrower.deletedAt) throw new Error("Borrower not found.");
+  const deletedAt = nowIso();
+  const loanIds = new Set(data.loans.filter((loan) => loan.borrowerId === borrowerId && !loan.deletedAt).map((loan) => loan.id));
+  const borrowers = data.borrowers.map((item) => item.id === borrowerId ? { ...item, deletedAt, updatedAt: deletedAt } : item);
+  const loans = data.loans.map((loan) => loanIds.has(loan.id) ? { ...loan, deletedAt, updatedAt: deletedAt } : loan);
+  return audit({ ...data, borrowers, loans }, "borrower", borrowerId, "deleted");
 }
 
 export function reversePayment(data: AppData, paymentId: string, reason: string): AppData {
@@ -331,6 +372,7 @@ export function reversePayment(data: AppData, paymentId: string, reason: string)
     createdAt: nowIso(),
   };
   const loan = getLoan(data, original.loanId);
+  if (loan.deletedAt) throw new Error("That loan has been deleted.");
   const balanceAfter = getLoanBalance({ ...data, payments: [...data.payments, reversal] }, loan.id);
   const loans = data.loans.map((item) =>
     item.id === loan.id
@@ -353,7 +395,7 @@ export function markRewardPaid(data: AppData, rewardId: string, paidDate: string
 
 export function voidLoan(data: AppData, loanId: string, reason: string): AppData {
   const loan = getLoan(data, loanId);
-  if (loan.state !== "pending_release") throw new Error("A released loan must be resolved before it can be voided.");
+  if (loan.deletedAt || loan.state !== "pending_release") throw new Error("A released loan must be resolved before it can be voided.");
   if (!reason.trim()) throw new Error("A void reason is required.");
   const loans = data.loans.map((item) =>
     item.id === loanId ? { ...item, state: "voided" as const, voidReason: reason.trim(), updatedAt: nowIso() } : item,
@@ -393,16 +435,22 @@ export function exportCsv(data: AppData): string {
   const lines = [
     ["record_type", "id", "borrower", "loan_id", "state", "amount", "date", "details"].map(csvEscape).join(","),
   ];
-  for (const borrower of data.borrowers) {
+  const borrowers = data.borrowers.filter((borrower) => !borrower.deletedAt);
+  const loans = data.loans.filter((loan) => !loan.deletedAt);
+  const borrowerIds = new Set(borrowers.map((borrower) => borrower.id));
+  const loanIds = new Set(loans.map((loan) => loan.id));
+  for (const borrower of borrowers) {
     lines.push(["borrower", borrower.id, borrower.fullName, "", "", "", borrower.createdAt.slice(0, 10), [borrower.phone, borrower.area, borrower.notes].filter(Boolean).join(" | ")].map(csvEscape).join(","));
   }
-  for (const loan of data.loans) {
+  for (const loan of loans) {
     lines.push(["loan", loan.id, borrowerName(data, loan.borrowerId), loan.id, loan.state, formatMoney(loan.totalDueCentavos), loan.startDate, `due ${loan.dueDate}; principal ${formatMoney(loan.principalCentavos)}`].map(csvEscape).join(","));
   }
   for (const payment of data.payments) {
+    if (!loanIds.has(payment.loanId)) continue;
     lines.push([payment.kind, payment.id, borrowerName(data, getLoan(data, payment.loanId).borrowerId), payment.loanId, payment.kind, formatMoney(payment.amountCentavos), payment.receivedDate, payment.note].map(csvEscape).join(","));
   }
   for (const reward of data.rewards) {
+    if (!loanIds.has(reward.loanId) || !borrowerIds.has(reward.borrowerId)) continue;
     lines.push(["reward", reward.id, borrowerName(data, reward.borrowerId), reward.loanId, reward.state, formatMoney(reward.amountCentavos), reward.paidDate ?? "", reward.guarantorName].map(csvEscape).join(","));
   }
   return lines.join("\n");

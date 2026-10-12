@@ -5,13 +5,16 @@ import {
   addDays,
   borrowerName,
   createLoan,
+  deleteBorrower,
   deleteCancelledLoans,
+  deleteLoan,
   emptyData,
   exportCsv,
   formatDate,
   formatMoney,
   getLoan,
   getLoanBalance,
+  getLoanDayStats,
   getLoanPayments,
   isPaymentReversed,
   likelyDuplicateBorrowers,
@@ -42,6 +45,8 @@ type ModalState =
   | { kind: "reverse"; paymentId: string }
   | { kind: "void"; loanId: string }
   | { kind: "restore"; data: AppData };
+
+type UndoState = { label: string; data: AppData };
 
 const localPinKey = "lanies-debt-manager:owner-pin:v1";
 const themeKey = "lanies-debt-manager:theme:v1";
@@ -227,9 +232,10 @@ function LocalLock({ configured, onUnlock, onError, theme, onToggleTheme }: { co
   );
 }
 
-function LoanCard({ data, loan, onOpen, onPay }: { data: AppData; loan: Loan; onOpen: () => void; onPay: () => void }) {
+function LoanCard({ data, loan, onOpen, onPay, onDelete }: { data: AppData; loan: Loan; onOpen: () => void; onPay: () => void; onDelete: () => void }) {
   const status = loanDisplayStatus(data, loan);
   const balance = getLoanBalance(data, loan.id);
+  const dayStats = getLoanDayStats(data, loan);
   return (
     <article className="record-card">
       <div className="record-card-top">
@@ -242,10 +248,13 @@ function LoanCard({ data, loan, onOpen, onPay }: { data: AppData; loan: Loan; on
       <div className="record-meta">
         <span>Total due {formatMoney(loan.totalDueCentavos)}</span>
         <span>Due {formatDate(loan.dueDate)}</span>
+        <span>{dayStats.daysPassed} day{dayStats.daysPassed === 1 ? "" : "s"} passed</span>
+        <span>{dayStats.noPaymentDays} no-payment day{dayStats.noPaymentDays === 1 ? "" : "s"}</span>
       </div>
       <div className="record-actions">
         <button className="button button-secondary" type="button" onClick={onOpen}>Open loan</button>
         {loan.state === "active" && <button className="button button-primary" type="button" onClick={onPay}>Record payment</button>}
+        <button className="button button-danger" type="button" onClick={onDelete}>Delete</button>
       </div>
     </article>
   );
@@ -267,6 +276,7 @@ function App() {
   const [loanFilter, setLoanFilter] = useState("all");
   const [borrowerSearch, setBorrowerSearch] = useState("");
   const [restoreCandidate, setRestoreCandidate] = useState<AppData | null>(null);
+  const [undo, setUndo] = useState<UndoState | null>(null);
   const [theme, setTheme] = useState<Theme>(() => localStorage.getItem(themeKey) === "dark" ? "dark" : "light");
 
   useEffect(() => {
@@ -308,6 +318,7 @@ function App() {
     let mounted = true;
     setLoading(true);
     setError("");
+    setUndo(null);
     loadData(activeOwnerId)
       .then((loaded) => { if (mounted) setData(loaded); })
       .catch((loadError) => { if (mounted) setError(loadError instanceof Error ? loadError.message : "Could not load your records."); })
@@ -321,6 +332,7 @@ function App() {
     try {
       await saveData(next, activeOwnerId);
       setData(next);
+      setUndo(null);
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : "Could not save that change.";
       setError(`${message} Your form is still open so you can retry.`);
@@ -342,13 +354,13 @@ function App() {
 
   const today = todayLocal();
   const summary = useMemo(() => {
-    const todayCollected = data.payments.filter((payment) => payment.kind === "payment" && payment.receivedDate === today).reduce((sum, payment) => sum + payment.amountCentavos, 0);
-    const activeLoans = data.loans.filter((loan) => loan.state === "active");
+    const todayCollected = data.payments.filter((payment) => payment.kind === "payment" && payment.receivedDate === today && data.loans.some((loan) => loan.id === payment.loanId && !loan.deletedAt)).reduce((sum, payment) => sum + payment.amountCentavos, 0);
+    const activeLoans = data.loans.filter((loan) => !loan.deletedAt && loan.state === "active");
     const dueSoon = activeLoans.filter((loan) => loanDisplayStatus(data, loan) === "due_soon");
     const overdue = activeLoans.filter((loan) => loanDisplayStatus(data, loan) === "overdue");
     return {
       todayCollected,
-      todayPayments: data.payments.filter((payment) => payment.kind === "payment" && payment.receivedDate === today).length,
+      todayPayments: data.payments.filter((payment) => payment.kind === "payment" && payment.receivedDate === today && data.loans.some((loan) => loan.id === payment.loanId && !loan.deletedAt)).length,
       activeCount: activeLoans.length,
       outstanding: activeLoans.reduce((sum, loan) => sum + getLoanBalance(data, loan.id), 0),
       dueSoon,
@@ -356,11 +368,12 @@ function App() {
     };
   }, [data, today]);
 
-  const recentPayments = useMemo(() => [...data.payments].sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 8), [data.payments]);
+  const recentPayments = useMemo(() => data.payments.filter((payment) => data.loans.some((loan) => loan.id === payment.loanId && !loan.deletedAt)).sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, 8), [data.loans, data.payments]);
 
   const filteredLoans = useMemo(() => {
     const query = loanSearch.trim().toLowerCase();
     return sortLoansByPriority(data.loans.filter((loan) => {
+      if (loan.deletedAt) return false;
       const status = loanDisplayStatus(data, loan);
       const borrower = data.borrowers.find((item) => item.id === loan.borrowerId);
       const textMatch = !query || [borrower?.fullName, borrower?.phone, borrower?.id, loan.id, borrower?.area].some((value) => value?.toLowerCase().includes(query));
@@ -371,7 +384,7 @@ function App() {
 
   const filteredBorrowers = useMemo(() => {
     const query = borrowerSearch.trim().toLowerCase();
-    return data.borrowers.filter((borrower) => !query || [borrower.fullName, borrower.phone, borrower.id, borrower.area].some((value) => value.toLowerCase().includes(query))).sort((a, b) => a.fullName.localeCompare(b.fullName));
+    return data.borrowers.filter((borrower) => !borrower.deletedAt && (!query || [borrower.fullName, borrower.phone, borrower.id, borrower.area].some((value) => value.toLowerCase().includes(query)))).sort((a, b) => a.fullName.localeCompare(b.fullName));
   }, [borrowerSearch, data.borrowers]);
 
   if (!authReady) return <main className="auth-shell"><div className="loading-card">Loading secure access…</div></main>;
@@ -387,13 +400,55 @@ function App() {
     setModal({ kind: "loanDetail", loanId: id });
   }
 
-  async function removeCancelledLoans() {
-    const cancelledCount = data.loans.filter((loan) => loan.state === "voided").length;
-    if (!cancelledCount || !window.confirm(`Delete ${cancelledCount} cancelled loan${cancelledCount === 1 ? "" : "s"}? This cannot be undone.`)) return;
+  async function removeLoan(loanId: string) {
+    const loan = data.loans.find((item) => item.id === loanId);
+    if (!loan || loan.deletedAt) return;
+    const name = borrowerName(data, loan.borrowerId);
+    if (!window.confirm(`Delete the loan for ${name}? Its payment history will be kept and you can undo this now.`)) return;
+    const previous = data;
     try {
-      await commit(deleteCancelledLoans(data));
+      await commit(deleteLoan(data, loanId));
+      setModal(null);
+      setUndo({ data: previous, label: `Loan for ${name} deleted.` });
     } catch {
       // The save error is shown above and the records remain unchanged.
+    }
+  }
+
+  async function removeBorrower(borrowerId: string) {
+    const borrower = data.borrowers.find((item) => item.id === borrowerId);
+    if (!borrower || borrower.deletedAt) return;
+    if (!window.confirm(`Delete ${borrower.fullName} and hide their loans? You can undo this now.`)) return;
+    const previous = data;
+    try {
+      await commit(deleteBorrower(data, borrowerId));
+      setBorrowerProfileId(null);
+      setModal(null);
+      setUndo({ data: previous, label: `${borrower.fullName} and their loans deleted.` });
+    } catch {
+      // The save error is shown above and the records remain unchanged.
+    }
+  }
+
+  async function removeCancelledLoans() {
+    const cancelledCount = data.loans.filter((loan) => !loan.deletedAt && loan.state === "voided").length;
+    if (!cancelledCount || !window.confirm(`Delete ${cancelledCount} cancelled loan${cancelledCount === 1 ? "" : "s"}? You can undo this now.`)) return;
+    const previous = data;
+    try {
+      await commit(deleteCancelledLoans(data));
+      setUndo({ data: previous, label: `${cancelledCount} cancelled loan${cancelledCount === 1 ? "" : "s"} deleted.` });
+    } catch {
+      // The save error is shown above and the records remain unchanged.
+    }
+  }
+
+  async function undoDelete() {
+    if (!undo) return;
+    try {
+      await commit(undo.data);
+      setUndo(null);
+    } catch {
+      // The save error is shown above and the undo remains available.
     }
   }
 
@@ -422,7 +477,7 @@ function App() {
     }
   }
 
-  const profile = borrowerProfileId ? data.borrowers.find((borrower) => borrower.id === borrowerProfileId) : undefined;
+  const profile = borrowerProfileId ? data.borrowers.find((borrower) => borrower.id === borrowerProfileId && !borrower.deletedAt) : undefined;
 
   return (
     <div className="app-shell">
@@ -439,6 +494,7 @@ function App() {
       </header>
 
       {error && <div className="app-error" role="alert"><span>{error}</span><button type="button" aria-label="Dismiss error" onClick={() => setError("")}>×</button></div>}
+      {undo && <div className="undo-toast" role="status" aria-live="polite"><span>{undo.label}</span><button className="button button-small button-secondary" type="button" disabled={saving} onClick={() => void undoDelete()}>Undo</button></div>}
       {loading && <div className="loading-bar" aria-label="Loading" />}
 
       <main className="page-content">
@@ -456,9 +512,9 @@ function App() {
         )}
         {view === "loans" && (
           <section className="page-section">
-            <PageHeading title="Loans" action={<div className="heading-actions">{data.loans.some((loan) => loan.state === "voided") && <button className="button button-danger" type="button" onClick={() => void removeCancelledLoans()}>Delete all cancelled</button>}<button className="button button-primary" type="button" onClick={() => setModal({ kind: "loan" })}>+ New loan</button></div>} />
+            <PageHeading title="Loans" action={<div className="heading-actions">{data.loans.some((loan) => !loan.deletedAt && loan.state === "voided") && <button className="button button-danger" type="button" onClick={() => void removeCancelledLoans()}>Delete all cancelled</button>}<button className="button button-primary" type="button" onClick={() => setModal({ kind: "loan" })}>+ New loan</button></div>} />
             <div className="filter-row"><label className="search-field"><span aria-hidden="true">⌕</span><input placeholder="Search borrower, phone, ID, or area" value={loanSearch} onChange={(event) => setLoanSearch(event.target.value)} /></label><select aria-label="Filter loans" value={loanFilter} onChange={(event) => setLoanFilter(event.target.value)}><option value="all">All loans</option><option value="active">Active</option><option value="due_soon">Due soon</option><option value="overdue">Overdue</option><option value="pending_release">Pending release</option><option value="paid">Fully paid</option><option value="voided">Cancelled</option></select></div>
-            {filteredLoans.length ? <div className="record-grid">{filteredLoans.map((loan) => <LoanCard key={loan.id} data={data} loan={loan} onOpen={() => openLoan(loan.id)} onPay={() => setModal({ kind: "payment", loanId: loan.id })} />)}</div> : <EmptyState title="No loans found">Create a loan or clear the search to see your records.</EmptyState>}
+            {filteredLoans.length ? <div className="record-grid">{filteredLoans.map((loan) => <LoanCard key={loan.id} data={data} loan={loan} onOpen={() => openLoan(loan.id)} onPay={() => setModal({ kind: "payment", loanId: loan.id })} onDelete={() => void removeLoan(loan.id)} />)}</div> : <EmptyState title="No loans found">Create a loan or clear the search to see your records.</EmptyState>}
           </section>
         )}
         {view === "borrowers" && (
@@ -472,9 +528,11 @@ function App() {
             onAdd={() => setModal({ kind: "borrower" })}
             onOpenProfile={openBorrower}
             onEdit={(borrowerId) => setModal({ kind: "borrower", borrowerId })}
+            onDelete={(borrowerId) => void removeBorrower(borrowerId)}
             onOpenLoan={openLoan}
             onNewLoan={(borrowerId, priorLoanId) => setModal({ kind: "loan", borrowerId, priorLoanId })}
             onPay={(loanId) => setModal({ kind: "payment", loanId })}
+            onDeleteLoan={(loanId) => void removeLoan(loanId)}
           />
         )}
         {view === "more" && (
@@ -500,7 +558,7 @@ function App() {
       {modal?.kind === "release" && <ReleaseForm data={data} loanId={modal.loanId} saving={saving} commit={commit} onClose={() => setModal(null)} />}
       {modal?.kind === "reverse" && <ReverseForm data={data} paymentId={modal.paymentId} saving={saving} commit={commit} onClose={() => setModal(null)} />}
       {modal?.kind === "void" && <VoidForm data={data} loanId={modal.loanId} saving={saving} commit={commit} onClose={() => setModal(null)} />}
-      {modal?.kind === "loanDetail" && <LoanDetail data={data} loanId={modal.loanId} onClose={() => setModal(null)} onPay={(loanId) => setModal({ kind: "payment", loanId })} onRelease={(loanId) => setModal({ kind: "release", loanId })} onReverse={(paymentId) => setModal({ kind: "reverse", paymentId })} onVoid={(loanId) => setModal({ kind: "void", loanId })} onRenew={(loanId) => setModal({ kind: "loan", priorLoanId: loanId })} onOpenLoan={openLoan} />}
+      {modal?.kind === "loanDetail" && <LoanDetail data={data} loanId={modal.loanId} onClose={() => setModal(null)} onPay={(loanId) => setModal({ kind: "payment", loanId })} onRelease={(loanId) => setModal({ kind: "release", loanId })} onReverse={(paymentId) => setModal({ kind: "reverse", paymentId })} onVoid={(loanId) => setModal({ kind: "void", loanId })} onRenew={(loanId) => setModal({ kind: "loan", priorLoanId: loanId })} onDelete={(loanId) => void removeLoan(loanId)} onOpenLoan={openLoan} />}
       {modal?.kind === "restore" && restoreCandidate && <Modal title="Replace all records?" onClose={() => { setModal(null); setRestoreCandidate(null); }}><div className="stack"><p>This will replace the current borrowers, loans, payments, rewards, and settings with the selected backup. This cannot be undone from the app.</p><div className="warning-box">Make another backup first if the current records contain anything new.</div><div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => { setModal(null); setRestoreCandidate(null); }}>Cancel</button><button className="button button-danger" type="button" disabled={saving} onClick={() => void handleRestore()}>{saving ? "Restoring…" : "Replace and restore"}</button></div></div></Modal>}
     </div>
   );
@@ -529,7 +587,7 @@ function HomeView({ data, summary, recentPayments, onRecordPayment, onOpenLoan, 
         {!recentPayments.length && <p className="muted panel-empty">Payments will appear here after the first collection.</p>}
       </div>
     </div>
-    {!data.borrowers.length && <div className="onboarding-card"><div><h2>Start with a borrower</h2><p>Add the person before creating a loan. Every payment stays tied to the right person and loan.</p></div><button className="button button-primary" type="button" onClick={onAddBorrower}>Add borrower</button></div>}
+    {!data.borrowers.some((borrower) => !borrower.deletedAt) && <div className="onboarding-card"><div><h2>Start with a borrower</h2><p>Add the person before creating a loan. Every payment stays tied to the right person and loan.</p></div><button className="button button-primary" type="button" onClick={onAddBorrower}>Add borrower</button></div>}
   </section>;
 }
 
@@ -537,19 +595,21 @@ function SummaryCard({ label, value, detail, accent }: { label: string; value: s
   return <div className={`summary-card accent-${accent}`}><span className="summary-label">{label}</span><strong>{value}</strong><span className="summary-detail">{detail}</span></div>;
 }
 
-function BorrowersView({ data, profile, search, borrowers, onSearch, onBack, onAdd, onOpenProfile, onEdit, onOpenLoan, onNewLoan, onPay }: { data: AppData; profile?: Borrower; search: string; borrowers: Borrower[]; onSearch: (value: string) => void; onBack: () => void; onAdd: () => void; onOpenProfile: (id: string) => void; onEdit: (id: string) => void; onOpenLoan: (id: string) => void; onNewLoan: (borrowerId: string, priorLoanId?: string) => void; onPay: (loanId: string) => void }) {
+function BorrowersView({ data, profile, search, borrowers, onSearch, onBack, onAdd, onOpenProfile, onEdit, onDelete, onOpenLoan, onNewLoan, onPay, onDeleteLoan }: { data: AppData; profile?: Borrower; search: string; borrowers: Borrower[]; onSearch: (value: string) => void; onBack: () => void; onAdd: () => void; onOpenProfile: (id: string) => void; onEdit: (id: string) => void; onDelete: (id: string) => void; onOpenLoan: (id: string) => void; onNewLoan: (borrowerId: string, priorLoanId?: string) => void; onPay: (loanId: string) => void; onDeleteLoan: (id: string) => void }) {
   if (profile) {
-    const loans = sortLoansByPriority(data.loans.filter((loan) => loan.borrowerId === profile.id));
+    const loans = sortLoansByPriority(data.loans.filter((loan) => loan.borrowerId === profile.id && !loan.deletedAt));
     const outstanding = loans.filter((loan) => loan.state === "active").reduce((sum, loan) => sum + getLoanBalance(data, loan.id), 0);
-    return <section className="page-section"><button className="button button-link back-button" type="button" onClick={onBack}>← All borrowers</button><div className="profile-header"><div className="profile-avatar">{profile.fullName.slice(0, 1).toUpperCase()}</div><div className="profile-heading"><h1>{profile.fullName}</h1><p className="muted">{profile.phone || "No phone added"}{profile.area ? ` · ${profile.area}` : ""}</p></div><button className="button button-secondary" type="button" onClick={() => onEdit(profile.id)}>Edit</button></div><div className="profile-stats"><div><span>Unpaid balance</span><strong>{formatMoney(outstanding)}</strong></div><div><span>Loans</span><strong>{loans.length}</strong></div><div><span>Payments</span><strong>{data.payments.filter((payment) => loans.some((loan) => loan.id === payment.loanId)).filter((payment) => payment.kind === "payment").length}</strong></div></div><div className="profile-actions"><button className="button button-primary" type="button" onClick={() => onNewLoan(profile.id)}>＋ New loan for this borrower</button></div>{profile.notes && <div className="note-box"><strong>Notes</strong><p>{profile.notes}</p></div>}<div className="panel profile-loans"><div className="panel-heading"><div><h2>Loans and payments</h2></div></div>{loans.map((loan) => <div className="profile-loan" key={loan.id}><div className="profile-loan-heading"><div><button className="text-button" type="button" onClick={() => onOpenLoan(loan.id)}><strong>{formatMoney(loan.totalDueCentavos)} loan</strong></button><small>Started {formatDate(loan.startDate)} · Due {formatDate(loan.dueDate)}</small></div><StatusChip status={loanDisplayStatus(data, loan)} /></div><div className="profile-loan-meta"><span>Unpaid balance <strong>{formatMoney(getLoanBalance(data, loan.id))}</strong></span><span>{getLoanPayments(data, loan.id).length} payment record{getLoanPayments(data, loan.id).length === 1 ? "" : "s"}</span>{loan.state === "active" && <button className="button button-small button-primary" type="button" onClick={() => onPay(loan.id)}>Record payment</button>}{loan.state === "paid" && <button className="button button-small button-secondary" type="button" onClick={() => onNewLoan(profile.id, loan.id)}>Renew</button>}</div></div>)}{!loans.length && <EmptyState title="No loans yet">Create the first loan for this borrower.</EmptyState>}</div></section>;
+    return <section className="page-section"><button className="button button-link back-button" type="button" onClick={onBack}>← All borrowers</button><div className="profile-header"><div className="profile-avatar">{profile.fullName.slice(0, 1).toUpperCase()}</div><div className="profile-heading"><h1>{profile.fullName}</h1><p className="muted">{profile.phone || "No phone added"}{profile.area ? ` · ${profile.area}` : ""}</p></div><button className="button button-secondary" type="button" onClick={() => onEdit(profile.id)}>Edit</button><button className="button button-danger" type="button" onClick={() => onDelete(profile.id)}>Delete</button></div><div className="profile-stats"><div><span>Unpaid balance</span><strong>{formatMoney(outstanding)}</strong></div><div><span>Loans</span><strong>{loans.length}</strong></div><div><span>Payments</span><strong>{data.payments.filter((payment) => loans.some((loan) => loan.id === payment.loanId)).filter((payment) => payment.kind === "payment").length}</strong></div></div><div className="profile-actions"><button className="button button-primary" type="button" onClick={() => onNewLoan(profile.id)}>＋ New loan for this borrower</button></div>{profile.notes && <div className="note-box"><strong>Notes</strong><p>{profile.notes}</p></div>}<div className="panel profile-loans"><div className="panel-heading"><div><h2>Loans and payments</h2></div></div>{loans.map((loan) => { const dayStats = getLoanDayStats(data, loan); return <div className="profile-loan" key={loan.id}><div className="profile-loan-heading"><div><button className="text-button" type="button" onClick={() => onOpenLoan(loan.id)}><strong>{formatMoney(loan.totalDueCentavos)} loan</strong></button><small>Started {formatDate(loan.startDate)} · Due {formatDate(loan.dueDate)}</small></div><StatusChip status={loanDisplayStatus(data, loan)} /></div><div className="profile-loan-meta"><span>Unpaid balance <strong>{formatMoney(getLoanBalance(data, loan.id))}</strong></span><span>{getLoanPayments(data, loan.id).length} payment record{getLoanPayments(data, loan.id).length === 1 ? "" : "s"}</span><span>{dayStats.daysPassed} day{dayStats.daysPassed === 1 ? "" : "s"} passed</span><span>{dayStats.noPaymentDays} no-payment day{dayStats.noPaymentDays === 1 ? "" : "s"}</span>{loan.state === "active" && <button className="button button-small button-primary" type="button" onClick={() => onPay(loan.id)}>Record payment</button>}{loan.state === "paid" && <button className="button button-small button-secondary" type="button" onClick={() => onNewLoan(profile.id, loan.id)}>Renew</button>}<button className="button button-small button-danger" type="button" onClick={() => onDeleteLoan(loan.id)}>Delete</button></div></div>; })}{!loans.length && <EmptyState title="No loans yet">Create the first loan for this borrower.</EmptyState>}</div></section>;
   }
-  return <section className="page-section"><PageHeading title="Borrowers" action={<button className="button button-primary" type="button" onClick={onAdd}>＋ Add borrower</button>} /><label className="search-field full-search"><span aria-hidden="true">⌕</span><input placeholder="Search name, phone, ID, or area" value={search} onChange={(event) => onSearch(event.target.value)} /></label>{borrowers.length ? <div className="record-grid borrower-grid">{borrowers.map((borrower) => { const loans = data.loans.filter((loan) => loan.borrowerId === borrower.id); const activeBalance = loans.filter((loan) => loan.state === "active").reduce((sum, loan) => sum + getLoanBalance(data, loan.id), 0); return <button className="borrower-card" type="button" key={borrower.id} onClick={() => onOpenProfile(borrower.id)}><span className="avatar large-avatar">{borrower.fullName.slice(0, 1).toUpperCase()}</span><span className="borrower-card-main"><strong>{borrower.fullName}</strong><small>{borrower.phone || "No phone"}{borrower.area ? ` · ${borrower.area}` : ""}</small><small>{loans.length} loan{loans.length === 1 ? "" : "s"}</small></span><span className="borrower-card-side"><strong>{formatMoney(activeBalance)}</strong><small>unpaid balance</small></span></button>; })}</div> : <EmptyState title="No borrowers found">Add a borrower to start the records.</EmptyState>}</section>;
+  return <section className="page-section"><PageHeading title="Borrowers" action={<button className="button button-primary" type="button" onClick={onAdd}>＋ Add borrower</button>} /><label className="search-field full-search"><span aria-hidden="true">⌕</span><input placeholder="Search name, phone, ID, or area" value={search} onChange={(event) => onSearch(event.target.value)} /></label>{borrowers.length ? <div className="record-grid borrower-grid">{borrowers.map((borrower) => { const loans = data.loans.filter((loan) => loan.borrowerId === borrower.id && !loan.deletedAt); const activeBalance = loans.filter((loan) => loan.state === "active").reduce((sum, loan) => sum + getLoanBalance(data, loan.id), 0); return <article className="borrower-card" key={borrower.id}><button className="borrower-card-open" type="button" onClick={() => onOpenProfile(borrower.id)}><span className="avatar large-avatar">{borrower.fullName.slice(0, 1).toUpperCase()}</span><span className="borrower-card-main"><strong>{borrower.fullName}</strong><small>{borrower.phone || "No phone"}{borrower.area ? ` · ${borrower.area}` : ""}</small><small>{loans.length} loan{loans.length === 1 ? "" : "s"}</small></span><span className="borrower-card-side"><strong>{formatMoney(activeBalance)}</strong><small>unpaid balance</small></span></button><button className="button button-small button-danger" type="button" onClick={() => onDelete(borrower.id)}>Delete</button></article>; })}</div> : <EmptyState title="No borrowers found">Add a borrower to start the records.</EmptyState>}</section>;
 }
 
 function MoreView({ data, saving, onPayReward, onSaveSettings, onBackup, onCsv, onRestore }: { data: AppData; saving: boolean; onPayReward: (id: string) => Promise<void>; onSaveSettings: (settings: AppSettings) => Promise<void>; onBackup: () => void; onCsv: () => void; onRestore: (event: ChangeEvent<HTMLInputElement>) => Promise<void> }) {
-  const pendingRewards = data.rewards.filter((reward) => reward.state === "pending");
-  const paidRewards = data.rewards.filter((reward) => reward.state === "paid");
-  return <section className="page-section"><PageHeading title="More" /><div className="more-grid"><section className="panel"><div className="panel-heading"><div><h2>Guarantor rewards</h2></div><span className="count-badge">{pendingRewards.length} pending</span></div>{data.rewards.map((reward) => <RewardRow key={reward.id} data={data} reward={reward} saving={saving} onPay={() => void onPayReward(reward.id)} />)}{!data.rewards.length && <p className="muted panel-empty">Rewards appear here when a loan has a guarantor.</p>}{paidRewards.length > 0 && <p className="fine-print">Paid rewards stay in the records and cannot be paid twice.</p>}</section><SettingsPanel data={data} saving={saving} onSave={onSaveSettings} /></div><section className="panel tools-panel"><div className="panel-heading"><div><h2>Backup and export</h2></div></div><p className="muted">Backups contain personal and money records. Keep them somewhere private.</p><div className="tool-actions"><button className="button button-secondary" type="button" onClick={onBackup}>Download backup</button><button className="button button-secondary" type="button" onClick={onCsv}>Export CSV</button><label className="button button-secondary file-button">Restore backup<input type="file" accept="application/json,.json" onChange={(event) => void onRestore(event)} /></label></div><p className="fine-print">Restore replaces all current records after you confirm.</p></section></section>;
+  const visibleLoanIds = new Set(data.loans.filter((loan) => !loan.deletedAt).map((loan) => loan.id));
+  const rewards = data.rewards.filter((reward) => visibleLoanIds.has(reward.loanId) && !data.borrowers.find((borrower) => borrower.id === reward.borrowerId)?.deletedAt);
+  const pendingRewards = rewards.filter((reward) => reward.state === "pending");
+  const paidRewards = rewards.filter((reward) => reward.state === "paid");
+  return <section className="page-section"><PageHeading title="More" /><div className="more-grid"><section className="panel"><div className="panel-heading"><div><h2>Guarantor rewards</h2></div><span className="count-badge">{pendingRewards.length} pending</span></div>{rewards.map((reward) => <RewardRow key={reward.id} data={data} reward={reward} saving={saving} onPay={() => void onPayReward(reward.id)} />)}{!rewards.length && <p className="muted panel-empty">Rewards appear here when a loan has a guarantor.</p>}{paidRewards.length > 0 && <p className="fine-print">Paid rewards stay in the records and cannot be paid twice.</p>}</section><SettingsPanel data={data} saving={saving} onSave={onSaveSettings} /></div><section className="panel tools-panel"><div className="panel-heading"><div><h2>Backup and export</h2></div></div><p className="muted">Backups contain personal and money records. Keep them somewhere private.</p><div className="tool-actions"><button className="button button-secondary" type="button" onClick={onBackup}>Download backup</button><button className="button button-secondary" type="button" onClick={onCsv}>Export CSV</button><label className="button button-secondary file-button">Restore backup<input type="file" accept="application/json,.json" onChange={(event) => void onRestore(event)} /></label></div><p className="fine-print">Restore replaces all current records after you confirm.</p></section></section>;
 }
 
 function RewardRow({ data, reward, saving, onPay }: { data: AppData; reward: Reward; saving: boolean; onPay: () => void }) {
@@ -590,22 +650,23 @@ function LoanForm({ data, borrowerId, priorLoanId, saving, commit, onClose }: { 
   const [error, setError] = useState("");
   function updateDateOrTerm(key: "startDate" | "term", value: string) { setForm((current) => { const next = { ...current, [key]: value }; if (!dueTouched) next.dueDate = addDays(next.startDate, Number(next.term) || 0); return next; }); }
   async function submit(event: FormEvent) { event.preventDefault(); setError(""); try { const next = createLoan(data, { borrowerId: form.borrowerId, principalCentavos: parseMoney(form.principal), totalDueCentavos: parseMoney(form.total), startDate: form.startDate, dueDate: form.dueDate, termDays: Number(form.term), notes: form.notes, guarantorName: form.guarantorName, guarantorPhone: "", rewardCentavos: form.guarantorName.trim() ? parseMoney(form.reward) : undefined, priorLoanId }).data; await commit(next); onClose(); } catch (saveError) { setError(saveError instanceof Error ? saveError.message : "Could not create loan."); } }
-  return <Modal title={priorLoan ? "Renew loan" : "New loan"} onClose={onClose} wide><form className="stack" onSubmit={(event) => void submit(event)}><label>Borrower<select value={form.borrowerId} onChange={(event) => setForm({ ...form, borrowerId: event.target.value })} required><option value="">Select borrower</option>{data.borrowers.map((borrower) => <option key={borrower.id} value={borrower.id}>{borrower.fullName}{borrower.phone ? ` · ${borrower.phone}` : ""}</option>)}</select></label><div className="form-grid"><label>Principal<input inputMode="decimal" value={form.principal} onChange={(event) => setForm({ ...form, principal: event.target.value })} required /></label><label>Total due<input inputMode="decimal" value={form.total} onChange={(event) => setForm({ ...form, total: event.target.value })} required /><span className="field-hint">Extra charge: {(() => { try { return formatMoney(Math.max(0, parseMoney(form.total) - parseMoney(form.principal))); } catch { return "—"; } })()}</span></label><label>Start date<input type="date" value={form.startDate} onChange={(event) => updateDateOrTerm("startDate", event.target.value)} required /></label><label>Term (days)<input type="number" min="1" value={form.term} onChange={(event) => updateDateOrTerm("term", event.target.value)} required /></label><label>Due date <span className="field-hint">check the suggested date</span><input type="date" value={form.dueDate} onChange={(event) => { setDueTouched(true); setForm({ ...form, dueDate: event.target.value }); }} required /></label></div><div className="subheading">Guarantor <span className="field-hint">optional</span></div><div className="form-grid"><label>Name<input value={form.guarantorName} onChange={(event) => setForm({ ...form, guarantorName: event.target.value })} /></label><label>Reward amount<input inputMode="decimal" value={form.reward} onChange={(event) => setForm({ ...form, reward: event.target.value })} disabled={!form.guarantorName.trim()} /></label></div><label>Notes <span className="field-hint">optional</span><textarea rows={3} value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>{priorLoan && <div className="info-box">This creates a new loan linked to the old one. The old loan and its payment history stay unchanged.</div>}{error && <ErrorText>{error}</ErrorText>}<div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? "Saving…" : "Save as pending release"}</button></div></form></Modal>;
+  return <Modal title={priorLoan ? "Renew loan" : "New loan"} onClose={onClose} wide><form className="stack" onSubmit={(event) => void submit(event)}><label>Borrower<select value={form.borrowerId} onChange={(event) => setForm({ ...form, borrowerId: event.target.value })} required><option value="">Select borrower</option>{data.borrowers.filter((borrower) => !borrower.deletedAt).map((borrower) => <option key={borrower.id} value={borrower.id}>{borrower.fullName}{borrower.phone ? ` · ${borrower.phone}` : ""}</option>)}</select></label><div className="form-grid"><label>Principal<input inputMode="decimal" value={form.principal} onChange={(event) => setForm({ ...form, principal: event.target.value })} required /></label><label>Total due<input inputMode="decimal" value={form.total} onChange={(event) => setForm({ ...form, total: event.target.value })} required /><span className="field-hint">Extra charge: {(() => { try { return formatMoney(Math.max(0, parseMoney(form.total) - parseMoney(form.principal))); } catch { return "—"; } })()}</span></label><label>Start date<input type="date" value={form.startDate} onChange={(event) => updateDateOrTerm("startDate", event.target.value)} required /></label><label>Term (days)<input type="number" min="1" value={form.term} onChange={(event) => updateDateOrTerm("term", event.target.value)} required /></label><label>Due date <span className="field-hint">check the suggested date</span><input type="date" value={form.dueDate} onChange={(event) => { setDueTouched(true); setForm({ ...form, dueDate: event.target.value }); }} required /></label></div><div className="subheading">Guarantor <span className="field-hint">optional</span></div><div className="form-grid"><label>Name<input value={form.guarantorName} onChange={(event) => setForm({ ...form, guarantorName: event.target.value })} /></label><label>Reward amount<input inputMode="decimal" value={form.reward} onChange={(event) => setForm({ ...form, reward: event.target.value })} disabled={!form.guarantorName.trim()} /></label></div><label>Notes <span className="field-hint">optional</span><textarea rows={3} value={form.notes} onChange={(event) => setForm({ ...form, notes: event.target.value })} /></label>{priorLoan && <div className="info-box">This creates a new loan linked to the old one. The old loan and its payment history stay unchanged.</div>}{error && <ErrorText>{error}</ErrorText>}<div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-primary" type="submit" disabled={saving}>{saving ? "Saving…" : "Save as pending release"}</button></div></form></Modal>;
 }
 
 function PaymentForm({ data, loanId, saving, commit, onClose }: { data: AppData; loanId?: string; saving: boolean; commit: (next: AppData) => Promise<void>; onClose: () => void }) {
-  const activeLoans = data.loans.filter((loan) => loan.state === "active").sort((a, b) => borrowerName(data, a.borrowerId).localeCompare(borrowerName(data, b.borrowerId)));
+  const activeLoans = data.loans.filter((loan) => !loan.deletedAt && loan.state === "active").sort((a, b) => borrowerName(data, a.borrowerId).localeCompare(borrowerName(data, b.borrowerId)));
   const [form, setForm] = useState({ loanId: loanId ?? activeLoans[0]?.id ?? "", amount: "", receivedDate: todayLocal(), note: "" });
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [proofImage, setProofImage] = useState<string>();
   const [proofError, setProofError] = useState("");
-  const selected = data.loans.find((loan) => loan.id === form.loanId);
+  const selected = data.loans.find((loan) => loan.id === form.loanId && !loan.deletedAt);
   const balance = selected ? getLoanBalance(data, selected.id) : 0;
   let projected = "—";
   try { if (form.amount) projected = formatMoney(Math.max(0, balance - parseMoney(form.amount))); } catch { projected = "—"; }
   function selectProofImage(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
+    event.currentTarget.value = "";
     if (!file) return;
     setProofError("");
     if (!file.type.startsWith("image/")) { setProofError("Choose an image file."); return; }
@@ -617,7 +678,7 @@ function PaymentForm({ data, loanId, saving, commit, onClose }: { data: AppData;
     reader.readAsDataURL(file);
   }
   async function submit(event: FormEvent) { event.preventDefault(); if (submitting || saving) return; setError(""); setSubmitting(true); try { await commit(recordPayment(data, { loanId: form.loanId, amountCentavos: parseMoney(form.amount), receivedDate: form.receivedDate, note: form.note, proofImageDataUrl: proofImage })); onClose(); } catch (saveError) { setError(saveError instanceof Error ? saveError.message : "Could not record payment."); } finally { setSubmitting(false); } }
-  return <Modal title="Record payment" onClose={onClose}><form className="stack" onSubmit={(event) => void submit(event)}>{activeLoans.length ? <><label>Loan<select value={form.loanId} onChange={(event) => setForm({ ...form, loanId: event.target.value })} required><option value="">Select active loan</option>{activeLoans.map((loan) => <option key={loan.id} value={loan.id}>{borrowerName(data, loan.borrowerId)} · {formatMoney(getLoanBalance(data, loan.id))} remaining</option>)}</select></label><div className="balance-preview"><span>Current balance<strong>{formatMoney(balance)}</strong></span><span>After this payment<strong>{projected}</strong></span></div><div className="form-grid"><label>Amount<input autoFocus inputMode="decimal" placeholder="0.00" value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} required /></label><label>Date received<input type="date" value={form.receivedDate} onChange={(event) => setForm({ ...form, receivedDate: event.target.value })} required /></label></div><label>Note <span className="field-hint">optional</span><input value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} /></label><label>Proof image <span className="field-hint">optional</span><input type="file" accept="image/*" capture="environment" onChange={selectProofImage} /></label>{proofImage && <div className="proof-preview"><img src={proofImage} alt="Payment proof preview" /><button className="button button-small button-quiet" type="button" onClick={() => setProofImage(undefined)}>Remove image</button></div>}{proofError && <ErrorText>{proofError}</ErrorText>}</> : <EmptyState title="No active loans">Release a pending loan before recording a payment.</EmptyState>}{error && <ErrorText>{error}</ErrorText>}<div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button>{activeLoans.length > 0 && <button className="button button-primary" type="submit" disabled={saving || submitting}>{saving || submitting ? "Saving…" : "Save payment"}</button>}</div></form></Modal>;
+  return <Modal title="Record payment" onClose={onClose}><form className="stack" onSubmit={(event) => void submit(event)}>{activeLoans.length ? <><label>Loan<select value={form.loanId} onChange={(event) => setForm({ ...form, loanId: event.target.value })} required><option value="">Select active loan</option>{activeLoans.map((loan) => <option key={loan.id} value={loan.id}>{borrowerName(data, loan.borrowerId)} · {formatMoney(getLoanBalance(data, loan.id))} remaining</option>)}</select></label><div className="balance-preview"><span>Current balance<strong>{formatMoney(balance)}</strong></span><span>After this payment<strong>{projected}</strong></span></div><div className="form-grid"><label>Amount<input autoFocus inputMode="decimal" placeholder="0.00" value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} required /></label><label>Date received<input type="date" value={form.receivedDate} onChange={(event) => setForm({ ...form, receivedDate: event.target.value })} required /></label></div><label>Note <span className="field-hint">optional</span><input value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} /></label><div><span className="field-hint">Proof of payment (optional)</span><div className="proof-actions"><label className="button button-secondary file-button">Choose from gallery<input type="file" accept="image/*" onChange={selectProofImage} /></label><label className="button button-secondary file-button">Take picture<input type="file" accept="image/*" capture="environment" onChange={selectProofImage} /></label></div></div>{proofImage && <div className="proof-preview"><img src={proofImage} alt="Payment proof preview" /><button className="button button-small button-quiet" type="button" onClick={() => setProofImage(undefined)}>Remove image</button></div>}{proofError && <ErrorText>{proofError}</ErrorText>}</> : <EmptyState title="No active loans">Release a pending loan before recording a payment.</EmptyState>}{error && <ErrorText>{error}</ErrorText>}<div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button>{activeLoans.length > 0 && <button className="button button-primary" type="submit" disabled={saving || submitting}>{saving || submitting ? "Saving…" : "Save payment"}</button>}</div></form></Modal>;
 }
 
 function ReleaseForm({ data, loanId, saving, commit, onClose }: { data: AppData; loanId: string; saving: boolean; commit: (next: AppData) => Promise<void>; onClose: () => void }) {
@@ -645,12 +706,13 @@ function VoidForm({ data, loanId, saving, commit, onClose }: { data: AppData; lo
   return <Modal title="Cancel pending loan" onClose={onClose}><form className="stack" onSubmit={(event) => void submit(event)}><p>This is only available before cash release. The loan stays in the records with the reason.</p><label>Why are you cancelling it?<textarea autoFocus rows={3} value={reason} onChange={(event) => setReason(event.target.value)} required /></label>{error && <ErrorText>{error}</ErrorText>}<div className="modal-actions"><button className="button button-secondary" type="button" onClick={onClose}>Cancel</button><button className="button button-danger" type="submit" disabled={saving}>{saving ? "Saving…" : "Cancel loan"}</button></div></form></Modal>;
 }
 
-function LoanDetail({ data, loanId, onClose, onPay, onRelease, onReverse, onVoid, onRenew, onOpenLoan }: { data: AppData; loanId: string; onClose: () => void; onPay: (id: string) => void; onRelease: (id: string) => void; onReverse: (id: string) => void; onVoid: (id: string) => void; onRenew: (id: string) => void; onOpenLoan: (id: string) => void }) {
+function LoanDetail({ data, loanId, onClose, onPay, onRelease, onReverse, onVoid, onRenew, onDelete, onOpenLoan }: { data: AppData; loanId: string; onClose: () => void; onPay: (id: string) => void; onRelease: (id: string) => void; onReverse: (id: string) => void; onVoid: (id: string) => void; onRenew: (id: string) => void; onDelete: (id: string) => void; onOpenLoan: (id: string) => void }) {
   const loan = data.loans.find((item) => item.id === loanId);
-  if (!loan) return null;
+  if (!loan || loan.deletedAt) return null;
   const status = loanDisplayStatus(data, loan);
   const payments = getLoanPayments(data, loan.id);
-  return <Modal title="Loan details" onClose={onClose} wide><div className="detail-header"><div><p className="detail-name">{borrowerName(data, loan.borrowerId)}</p><h2 className="detail-balance">{formatMoney(getLoanBalance(data, loan.id))}</h2><p className="muted">unpaid balance</p></div><StatusChip status={status} /></div><div className="detail-grid"><div><span>Principal</span><strong>{formatMoney(loan.principalCentavos)}</strong></div><div><span>Total due</span><strong>{formatMoney(loan.totalDueCentavos)}</strong></div><div><span>Released</span><strong>{loan.releaseAmountCentavos === undefined ? "Not yet" : formatMoney(loan.releaseAmountCentavos)}</strong></div><div><span>Due date</span><strong>{formatDate(loan.dueDate)}</strong></div></div><div className="detail-actions">{loan.state === "pending_release" && <><button className="button button-primary" type="button" onClick={() => onRelease(loan.id)}>Confirm release</button><button className="button button-secondary" type="button" onClick={() => onVoid(loan.id)}>Cancel loan</button></>}{loan.state === "active" && <button className="button button-primary" type="button" onClick={() => onPay(loan.id)}>＋ Record payment</button>}{(loan.state === "paid" || loan.state === "active") && <button className="button button-secondary" type="button" onClick={() => onRenew(loan.id)}>Renew loan</button>}</div>{loan.priorLoanId && <div className="info-box">Renewed from <button className="text-button" type="button" onClick={() => onOpenLoan(loan.priorLoanId!)}>prior loan</button>.</div>}{loan.guarantorName && <div className="note-box"><strong>Guarantor</strong><p className="highlight-name">{loan.guarantorName}</p>{loan.guarantorPhone && <p>{loan.guarantorPhone}</p>}</div>}{loan.notes && <div className="note-box"><strong>Loan notes</strong><p>{loan.notes}</p></div>}<div className="detail-history"><div className="panel-heading"><div><h3>Payment history</h3></div><span className="count-badge">{payments.length} payment record{payments.length === 1 ? "" : "s"}</span></div>{payments.map((payment) => { const reversed = payment.kind === "payment" && isPaymentReversed(data, payment.id); return <div className="payment-row" key={payment.id}><span className={`activity-dot ${payment.kind === "reversal" ? "reversal-dot" : ""}`}>{payment.kind === "reversal" ? "↶" : "₱"}</span><div className="payment-main"><strong className="payment-date">{formatDate(payment.receivedDate)} {reversed && <span className="inline-label">corrected</span>}</strong><small>{payment.kind === "reversal" ? "Correction" : payment.note}</small></div><div className={`payment-amount ${payment.amountCentavos < 0 ? "negative" : ""}`}>{payment.amountCentavos < 0 ? "−" : "+"}{formatMoney(Math.abs(payment.amountCentavos))}</div>{payment.proofImageDataUrl && <a className="proof-link" href={payment.proofImageDataUrl} target="_blank" rel="noreferrer" aria-label="Open payment proof"><img src={payment.proofImageDataUrl} alt="Payment proof" /></a>}{payment.kind === "payment" && !reversed && <button className="button button-small button-quiet" type="button" onClick={() => onReverse(payment.id)}>Fix</button>}</div>; })}{!payments.length && <p className="muted panel-empty">No payments recorded yet.</p>}</div></Modal>;
+  const dayStats = getLoanDayStats(data, loan);
+  return <Modal title="Loan details" onClose={onClose} wide><div className="detail-header"><div><p className="detail-name">{borrowerName(data, loan.borrowerId)}</p><h2 className="detail-balance">{formatMoney(getLoanBalance(data, loan.id))}</h2><p className="muted">unpaid balance</p></div><StatusChip status={status} /></div><div className="detail-grid"><div><span>Principal</span><strong>{formatMoney(loan.principalCentavos)}</strong></div><div><span>Total due</span><strong>{formatMoney(loan.totalDueCentavos)}</strong></div><div><span>Released</span><strong>{loan.releaseAmountCentavos === undefined ? "Not yet" : formatMoney(loan.releaseAmountCentavos)}</strong></div><div><span>Due date</span><strong>{formatDate(loan.dueDate)}</strong></div><div><span>Days passed</span><strong>{dayStats.daysPassed}</strong></div><div><span>No-payment days</span><strong>{dayStats.noPaymentDays}</strong></div></div><div className="detail-actions">{loan.state === "pending_release" && <><button className="button button-primary" type="button" onClick={() => onRelease(loan.id)}>Confirm release</button><button className="button button-secondary" type="button" onClick={() => onVoid(loan.id)}>Cancel loan</button></>}{loan.state === "active" && <button className="button button-primary" type="button" onClick={() => onPay(loan.id)}>＋ Record payment</button>}{(loan.state === "paid" || loan.state === "active") && <button className="button button-secondary" type="button" onClick={() => onRenew(loan.id)}>Renew loan</button>}<button className="button button-danger" type="button" onClick={() => onDelete(loan.id)}>Delete loan</button></div>{loan.priorLoanId && <div className="info-box">Renewed from <button className="text-button" type="button" onClick={() => onOpenLoan(loan.priorLoanId!)}>prior loan</button>.</div>}{loan.guarantorName && <div className="note-box"><strong>Guarantor</strong><p className="highlight-name">{loan.guarantorName}</p>{loan.guarantorPhone && <p>{loan.guarantorPhone}</p>}</div>}{loan.notes && <div className="note-box"><strong>Loan notes</strong><p>{loan.notes}</p></div>}<div className="detail-history"><div className="panel-heading"><div><h3>Payment history</h3></div><span className="count-badge">{payments.length} payment record{payments.length === 1 ? "" : "s"}</span></div>{payments.map((payment) => { const reversed = payment.kind === "payment" && isPaymentReversed(data, payment.id); return <div className="payment-row" key={payment.id}><span className={`activity-dot ${payment.kind === "reversal" ? "reversal-dot" : ""}`}>{payment.kind === "reversal" ? "↶" : "₱"}</span><div className="payment-main"><strong className="payment-date">{formatDate(payment.receivedDate)} {reversed && <span className="inline-label">corrected</span>}</strong><small>{payment.kind === "reversal" ? "Correction" : payment.note}</small></div><div className={`payment-amount ${payment.amountCentavos < 0 ? "negative" : ""}`}>{payment.amountCentavos < 0 ? "−" : "+"}{formatMoney(Math.abs(payment.amountCentavos))}</div>{payment.proofImageDataUrl && <a className="proof-link" href={payment.proofImageDataUrl} target="_blank" rel="noreferrer" aria-label="Open payment proof"><img src={payment.proofImageDataUrl} alt="Payment proof" /></a>}{payment.kind === "payment" && !reversed && <button className="button button-small button-quiet" type="button" onClick={() => onReverse(payment.id)}>Fix</button>}</div>; })}{!payments.length && <p className="muted panel-empty">No payments recorded yet.</p>}</div></Modal>;
 }
 
 export default App;
