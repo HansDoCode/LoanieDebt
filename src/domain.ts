@@ -8,9 +8,15 @@ import type {
   Reward,
 } from "./types";
 
+export function totalDueForPrincipal(principalCentavos: number): number {
+  const totalDueCentavos = Math.round(principalCentavos * 1.2);
+  if (!Number.isSafeInteger(totalDueCentavos)) throw new Error("That amount is too large.");
+  return totalDueCentavos;
+}
+
 export const DEFAULT_SETTINGS: AppSettings = {
   defaultPrincipalCentavos: 1_000_000,
-  defaultTotalDueCentavos: 1_200_000,
+  defaultTotalDueCentavos: totalDueForPrincipal(1_000_000),
   defaultTermDays: 40,
   defaultRewardCentavos: 50_000,
 };
@@ -222,7 +228,6 @@ export function updateBorrower(
 export interface LoanInput {
   borrowerId: string;
   principalCentavos: number;
-  totalDueCentavos: number;
   startDate: string;
   dueDate: string;
   termDays: number;
@@ -237,7 +242,7 @@ export interface LoanInput {
 export function createLoan(data: AppData, input: LoanInput): { data: AppData; loan: Loan } {
   if (!data.borrowers.some((borrower) => borrower.id === input.borrowerId && !borrower.deletedAt)) throw new Error("Select a borrower.");
   if (!Number.isSafeInteger(input.principalCentavos) || input.principalCentavos <= 0) throw new Error("Principal must be greater than zero.");
-  if (!Number.isSafeInteger(input.totalDueCentavos) || input.totalDueCentavos < input.principalCentavos) throw new Error("Total due must be at least the principal.");
+  const totalDueCentavos = totalDueForPrincipal(input.principalCentavos);
   if (!input.startDate || !input.dueDate) throw new Error("Start and due dates are required.");
   if (!Number.isInteger(input.termDays) || input.termDays <= 0) throw new Error("Term must be a positive number of days.");
   if (!input.signatureImageDataUrl?.trim()) throw new Error("A signature photo is required for every loan.");
@@ -248,7 +253,7 @@ export function createLoan(data: AppData, input: LoanInput): { data: AppData; lo
     borrowerId: input.borrowerId,
     priorLoanId: input.priorLoanId,
     principalCentavos: input.principalCentavos,
-    totalDueCentavos: input.totalDueCentavos,
+    totalDueCentavos,
     startDate: input.startDate,
     dueDate: input.dueDate,
     termDays: input.termDays,
@@ -412,11 +417,12 @@ export function normalizeData(value: unknown): AppData {
     throw new Error("Backup is missing required records.");
   }
   const settings = candidate.settings ?? DEFAULT_SETTINGS;
+  const defaultPrincipalCentavos = Number(settings.defaultPrincipalCentavos) || DEFAULT_SETTINGS.defaultPrincipalCentavos;
   return {
     schemaVersion: 1,
     settings: {
-      defaultPrincipalCentavos: Number(settings.defaultPrincipalCentavos) || DEFAULT_SETTINGS.defaultPrincipalCentavos,
-      defaultTotalDueCentavos: Number(settings.defaultTotalDueCentavos) || DEFAULT_SETTINGS.defaultTotalDueCentavos,
+      defaultPrincipalCentavos,
+      defaultTotalDueCentavos: totalDueForPrincipal(defaultPrincipalCentavos),
       defaultTermDays: Number(settings.defaultTermDays) || DEFAULT_SETTINGS.defaultTermDays,
       defaultRewardCentavos: Number(settings.defaultRewardCentavos) || DEFAULT_SETTINGS.defaultRewardCentavos,
     },

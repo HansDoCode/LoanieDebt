@@ -12,6 +12,7 @@ import {
   recordPayment,
   releaseLoan,
   reversePayment,
+  totalDueForPrincipal,
   voidLoan,
 } from "./domain";
 
@@ -21,7 +22,6 @@ function fixture() {
   const created = createLoan(withBorrower, {
     borrowerId: borrower.id,
     principalCentavos: 1_000_000,
-    totalDueCentavos: 1_200_000,
     startDate: "2026-01-01",
     dueDate: "2026-02-10",
     termDays: 40,
@@ -81,7 +81,6 @@ describe("debt ledger rules", () => {
     const renewed = createLoan(paid, {
       borrowerId: borrower.id,
       principalCentavos: 500_000,
-      totalDueCentavos: 600_000,
       startDate: "2026-02-11",
       dueDate: "2026-03-23",
       termDays: 40,
@@ -103,7 +102,6 @@ describe("debt ledger rules", () => {
     expect(() => createLoan(withBorrower, {
       borrowerId: borrower.id,
       principalCentavos: 1_000_000,
-      totalDueCentavos: 1_200_000,
       startDate: "2026-01-01",
       dueDate: "2026-02-10",
       termDays: 40,
@@ -112,6 +110,10 @@ describe("debt ledger rules", () => {
       guarantorPhone: "",
       signatureImageDataUrl: "",
     })).toThrow("signature photo");
+  });
+
+  it("calculates total due as principal plus 20 percent", () => {
+    expect(totalDueForPrincipal(2_000_000)).toBe(2_400_000);
   });
 
   it("deletes cancelled loans without touching borrowers", () => {

@@ -16,14 +16,14 @@ This is a personal record-keeping tool, not a multi-lender service. Keep the fir
 
 ## 2. Defaults and loan terms
 
-Use these as editable defaults for a new loan, not fixed values:
+Use these as defaults for a new loan:
 
 - Principal: ₱10,000
-- Total due: ₱12,000
+- Total due: ₱12,000 (principal + 20%, calculated automatically)
 - Term: 40 calendar days
-- Added charge: ₱2,000
+- Added charge: 20% of principal
 
-The lender must be able to change the principal, total due, start date, and term for each loan. Show the added charge as `total due − principal`; do not ask the lender to enter a separate rate that could disagree with the total. If a rate is needed for a record, treat it as descriptive and calculate the actual amount due from the entered total.
+The lender must be able to change the principal, start date, and term for each loan. Calculate total due as `principal × 1.20`; total due and the added charge are read-only. Store currency as integer centavos (for example, ₱12,000.50 as 1,200,050 centavos) to avoid rounding errors.
 
 When a start date and term are entered, suggest a due date. Let the lender review it before saving. Store currency as integer centavos (for example, ₱12,000.50 as 1,200,050 centavos) to avoid rounding errors.
 
